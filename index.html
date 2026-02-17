@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neon Air Hockey - Single Player</title>
+  <style>
+    :root {
+      --bg: #060912;
+      --panel: #0b1020;
+      --neon-blue: #36b7ff;
+      --neon-red: #ff486f;
+      --neon-white: #e9f7ff;
+      --text: #d5e9ff;
+      --muted: #89a4c9;
+      --glow: 0 0 10px currentColor, 0 0 22px currentColor;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle at 50% 10%, #131c35 0%, var(--bg) 45%, #03050a 100%);
+      color: var(--text);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+
+    .shell {
+      width: min(96vw, 980px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .board-wrap {
+      width: 100%;
+      max-width: 900px;
+      aspect-ratio: 4 / 3;
+      background: linear-gradient(180deg, rgba(11,16,32,0.8), rgba(7,11,24,0.85));
+      border-radius: 16px;
+      border: 1px solid rgba(76, 122, 191, 0.35);
+      box-shadow: inset 0 0 40px rgba(16, 58, 120, 0.25), 0 18px 50px rgba(0, 0, 0, 0.4);
+      padding: clamp(8px, 1.4vw, 14px);
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      border-radius: 10px;
+      background: #04070f;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    canvas:active { cursor: grabbing; }
+
+    .caption {
+      font-size: 0.92rem;
+      color: var(--muted);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="board-wrap">
+      <canvas id="game" width="800" height="600" aria-label="Single-player air hockey game"></canvas>
+    </div>
+    <div class="caption">Drag your mouse/finger to control the blue paddle. First to 7 wins.</div>
+  </div>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+      const W = 800;
+      const H = 600;
+      const GOAL_HEIGHT = 170;
+      const TARGET_SCORE = 7;
+      const CENTER_X = W / 2;
+      const CENTER_Y = H / 2;
+
+      const frictionPerFrame = 0.995;
+      const wallRestitution = 0.97;
+      const paddleRestitution = 1.02;
+      const maxPuckSpeed = 880;
+
+      const state = {
+        phase: 'menu', // menu | countdown | play | goalPause | gameOver
+        difficulty: null,
+        countdownEnd: 0,
+        pauseEnd: 0,
+        goalText: 'GOAL!',
+        winner: '',
+        pointerActive: false,
+        pointerX: CENTER_X,
+        pointerY: H - 80,
+        aiSenseX: CENTER_X,
+        aiSenseY: CENTER_Y,
+        aiSenseTimer: 0
+      };
+
+      const difficultySettings = {
+        easy: {
+          label: 'Easy',
+          aiSpeed: 270,
+          reaction: 0.08,
+          defenseBias: 0.45,
+          prediction: 0.0,
+          jitter: 16
+        },
+        medium: {
+          label: 'Medium',
+          aiSpeed: 420,
+          reaction: 0.2,
+          defenseBias: 0.6,
+          prediction: 0.45,
+          jitter: 8
+        },
+        hard: {
+          label: 'Hard',
+          aiSpeed: 600,
+          reaction: 0.38,
+          defenseBias: 0.78,
+          prediction: 1.0,
+          jitter: 3
+        }
+      };
+
+      const ui = {
+        buttons: []
+      };
+
+      const player = {
+        x: CENTER_X,
+        y: H - 90,
+        r: 38,
+        color: '#36b7ff',
+        vx: 0,
+        vy: 0,
+        maxSpeed: 760
+      };
+
+      const ai = {
+        x: CENTER_X,
+        y: 90,
+        r: 38,
+        color: '#ff486f',
+        vx: 0,
+        vy: 0,
+        targetX: CENTER_X,
+        targetY: 90
+      };
+
+      const puck = {
+        x: CENTER_X,
+        y: CENTER_Y,
+        r: 14,
+        color: '#f5fbff',
+        vx: 0,
+        vy: 0,
+      };
+
+      const score = { player: 0, ai: 0 };
+      const particles = [];
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      function rand(min, max) {
+        return min + Math.random() * (max - min);
+      }
+
+      function frameScale(base, dt) {
+        return Math.pow(base, dt * 60);
+      }
+
+      function setPhase(phase, seconds = 0) {
+        state.phase = phase;
+        const end = performance.now() + seconds * 1000;
+        if (phase === 'countdown') state.countdownEnd = end;
+        if (phase === 'goalPause') state.pauseEnd = end;
+      }
+
+      function resetPaddles() {
+        player.x = CENTER_X;
+        player.y = H - 90;
+        player.vx = player.vy = 0;
+        ai.x = CENTER_X;
+        ai.y = 90;
+        ai.vx = ai.vy = 0;
+        ai.targetX = CENTER_X;
+        ai.targetY = 90;
+      }
+
+      function launchPuck() {
+        const angle = rand(-Math.PI * 0.32, Math.PI * 0.32) + (Math.random() < 0.5 ? 0 : Math.PI);
+        const speed = rand(330, 460);
+        puck.vx = Math.cos(angle) * speed;
+        puck.vy = Math.sin(angle) * speed;
+      }
+
+      function resetPuck(stationary = true) {
+        puck.x = CENTER_X;
+        puck.y = CENTER_Y;
+        puck.vx = stationary ? 0 : puck.vx;
+        puck.vy = stationary ? 0 : puck.vy;
+      }
+
+      function startGame(difficultyKey) {
+        state.difficulty = difficultyKey;
+        score.player = 0;
+        score.ai = 0;
+        particles.length = 0;
+        state.goalText = 'GOAL!';
+        state.aiSenseX = CENTER_X;
+        state.aiSenseY = CENTER_Y;
+        state.aiSenseTimer = 0;
+        resetPaddles();
+        resetPuck(true);
+        setPhase('countdown', 1);
+      }
+
+      function spawnImpactParticles(x, y, color, amount = 14, speed = 260) {
+        for (let i = 0; i < amount; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const s = speed * (0.4 + Math.random() * 0.85);
+          particles.push({
+            x,
+            y,
+            vx: Math.cos(a) * s,
+            vy: Math.sin(a) * s,
+            life: 0.42 + Math.random() * 0.38,
+            age: 0,
+            size: 1.5 + Math.random() * 3,
+            color
+          });
+        }
+      }
+
+      function spawnGoalBurst(isPlayerGoal) {
+        const color = isPlayerGoal ? '#36b7ff' : '#ff486f';
+        for (let i = 0; i < 90; i++) {
+          const x = rand(80, W - 80);
+          const y = isPlayerGoal ? rand(40, 145) : rand(H - 145, H - 40);
+          const a = Math.random() * Math.PI * 2;
+          const s = rand(180, 500);
+          particles.push({
+            x,
+            y,
+            vx: Math.cos(a) * s,
+            vy: Math.sin(a) * s,
+            life: 0.35 + Math.random() * 0.65,
+            age: 0,
+            size: 2 + Math.random() * 4,
+            color
+          });
+        }
+      }
+
+      function updateParticles(dt) {
+        for (let i = particles.length - 1; i >= 0; i--) {
+          const p = particles[i];
+          p.age += dt;
+          if (p.age >= p.life) {
+            particles.splice(i, 1);
+            continue;
+          }
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          const drag = frameScale(0.97, dt);
+          p.vx *= drag;
+          p.vy *= drag;
+        }
+      }
+
+      function resolvePaddleCollision(pad) {
+        const dx = puck.x - pad.x;
+        const dy = puck.y - pad.y;
+        const dist = Math.hypot(dx, dy);
+        const minDist = puck.r + pad.r;
+
+        if (dist < minDist && dist > 0.0001) {
+          const nx = dx / dist;
+          const ny = dy / dist;
+          const overlap = minDist - dist;
+          puck.x += nx * overlap;
+          puck.y += ny * overlap;
+
+          const relVx = puck.vx - pad.vx;
+          const relVy = puck.vy - pad.vy;
+          const relDot = relVx * nx + relVy * ny;
+
+          if (relDot < 0) {
+            const impulse = -(1 + paddleRestitution) * relDot;
+            puck.vx += nx * impulse;
+            puck.vy += ny * impulse;
+
+            puck.vx += pad.vx * 0.32;
+            puck.vy += pad.vy * 0.32;
+
+            spawnImpactParticles(
+              puck.x - nx * puck.r,
+              puck.y - ny * puck.r,
+              pad.color,
+              18,
+              340
+            );
+          }
+        }
+      }
+
+      function limitPuckSpeed() {
+        const speed = Math.hypot(puck.vx, puck.vy);
+        if (speed > maxPuckSpeed) {
+          const scale = maxPuckSpeed / speed;
+          puck.vx *= scale;
+          puck.vy *= scale;
+        }
+      }
+
+      function keepPaddleInHalf(pad, isPlayer) {
+        pad.x = clamp(pad.x, pad.r, W - pad.r);
+        if (isPlayer) {
+          pad.y = clamp(pad.y, CENTER_Y + 30 + pad.r * 0.1, H - pad.r);
+        } else {
+          pad.y = clamp(pad.y, pad.r, CENTER_Y - 30 - pad.r * 0.1);
+        }
+      }
+
+      function updatePlayer(dt) {
+        const tx = state.pointerActive ? state.pointerX : player.x;
+        const ty = state.pointerActive ? state.pointerY : player.y;
+
+        const stiffness = 15;
+        const damping = frameScale(0.85, dt);
+
+        const ax = (tx - player.x) * stiffness;
+        const ay = (ty - player.y) * stiffness;
+
+        player.vx = player.vx * damping + ax * dt;
+        player.vy = player.vy * damping + ay * dt;
+
+        const s = Math.hypot(player.vx, player.vy);
+        if (s > player.maxSpeed) {
+          const k = player.maxSpeed / s;
+          player.vx *= k;
+          player.vy *= k;
+        }
+
+        player.x += player.vx * dt;
+        player.y += player.vy * dt;
+        keepPaddleInHalf(player, true);
+      }
+
+      function predictPuckXForAI(maxBounces = 5) {
+        const settings = difficultySettings[state.difficulty];
+        const trackTopY = 120;
+        if (puck.vy >= 0) return CENTER_X;
+
+        let testX = puck.x;
+        let testY = puck.y;
+        let vx = puck.vx;
+        let vy = puck.vy;
+        let bounces = 0;
+
+        while (testY > trackTopY && bounces <= maxBounces) {
+          const tToLine = (trackTopY - testY) / vy;
+          const tToLeft = (puck.r - testX) / vx;
+          const tToRight = ((W - puck.r) - testX) / vx;
+
+          let tWall = Infinity;
+          if (vx < -0.01) tWall = tToLeft;
+          if (vx > 0.01) tWall = tToRight;
+
+          if (tToLine >= 0 && tToLine < tWall) {
+            testX += vx * tToLine;
+            break;
+          }
+
+          if (Number.isFinite(tWall) && tWall >= 0) {
+            testX += vx * tWall;
+            testY += vy * tWall;
+            vx *= -1;
+            bounces++;
+          } else {
+            break;
+          }
+        }
+
+        const blend = settings.prediction;
+        return puck.x * (1 - blend) + testX * blend + rand(-settings.jitter, settings.jitter);
+      }
+
+      function updateAI(dt) {
+        const settings = difficultySettings[state.difficulty];
+
+        state.aiSenseTimer -= dt;
+        if (state.difficulty !== 'easy') {
+          state.aiSenseX = puck.x;
+          state.aiSenseY = puck.y;
+        } else if (state.aiSenseTimer <= 0) {
+          // Easy mode samples the puck less frequently, creating visible reaction delay.
+          state.aiSenseX = puck.x;
+          state.aiSenseY = puck.y;
+          state.aiSenseTimer = 0.18;
+        }
+
+        const sensedX = state.aiSenseX;
+        const sensedY = state.aiSenseY;
+
+        const defensiveX = CENTER_X + (sensedX - CENTER_X) * settings.defenseBias;
+        const defensiveY = 92;
+
+        let targetX = defensiveX;
+        let targetY = defensiveY;
+
+        const puckOnAISide = sensedY < CENTER_Y + 15;
+        if (puckOnAISide) {
+          if (state.difficulty === 'easy') {
+            targetX = sensedX;
+            targetY = clamp(sensedY - 35, ai.r + 5, CENTER_Y - 55);
+          } else if (state.difficulty === 'medium') {
+            targetX = sensedX;
+            targetY = clamp(sensedY - 25, ai.r + 5, CENTER_Y - 48);
+          } else {
+            targetX = predictPuckXForAI();
+            // Hard mode plays smart defense: retreat/guard when puck is moving away.
+            targetY = puck.vy < 0
+              ? clamp(puck.y - 20, ai.r + 5, CENTER_Y - 55)
+              : clamp(86 + Math.abs(puck.x - CENTER_X) * 0.05, ai.r + 5, 118);
+          }
+        }
+
+        ai.targetX += (targetX - ai.targetX) * settings.reaction;
+        ai.targetY += (targetY - ai.targetY) * settings.reaction;
+
+        const dx = ai.targetX - ai.x;
+        const dy = ai.targetY - ai.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist > 0.001) {
+          const maxStep = settings.aiSpeed * dt;
+          const step = Math.min(maxStep, dist);
+          ai.vx = (dx / dist) * step / dt;
+          ai.vy = (dy / dist) * step / dt;
+          ai.x += (dx / dist) * step;
+          ai.y += (dy / dist) * step;
+        } else {
+          const idleDamping = frameScale(0.85, dt);
+          ai.vx *= idleDamping;
+          ai.vy *= idleDamping;
+        }
+
+        keepPaddleInHalf(ai, false);
+      }
+
+      function updatePuck(dt) {
+        puck.x += puck.vx * dt;
+        puck.y += puck.vy * dt;
+
+        const puckFriction = frameScale(frictionPerFrame, dt);
+        puck.vx *= puckFriction;
+        puck.vy *= puckFriction;
+
+        if (puck.x - puck.r <= 0) {
+          puck.x = puck.r;
+          puck.vx = Math.abs(puck.vx) * wallRestitution;
+          spawnImpactParticles(puck.x, puck.y, '#a9e7ff', 8, 220);
+        } else if (puck.x + puck.r >= W) {
+          puck.x = W - puck.r;
+          puck.vx = -Math.abs(puck.vx) * wallRestitution;
+          spawnImpactParticles(puck.x, puck.y, '#a9e7ff', 8, 220);
+        }
+
+        const inGoalMouth = Math.abs(puck.x - CENTER_X) <= GOAL_HEIGHT / 2;
+
+        if (!inGoalMouth) {
+          if (puck.y - puck.r <= 0) {
+            puck.y = puck.r;
+            puck.vy = Math.abs(puck.vy) * wallRestitution;
+          } else if (puck.y + puck.r >= H) {
+            puck.y = H - puck.r;
+            puck.vy = -Math.abs(puck.vy) * wallRestitution;
+          }
+        }
+
+        resolvePaddleCollision(player);
+        resolvePaddleCollision(ai);
+        limitPuckSpeed();
+
+        if (puck.y + puck.r < -10 && inGoalMouth) {
+          score.player++;
+          onGoal(true);
+        } else if (puck.y - puck.r > H + 10 && inGoalMouth) {
+          score.ai++;
+          onGoal(false);
+        }
+      }
+
+      function onGoal(playerScored) {
+        spawnGoalBurst(playerScored);
+        state.goalText = playerScored ? 'YOU SCORED!' : 'AI SCORED!';
+        if (score.player >= TARGET_SCORE || score.ai >= TARGET_SCORE) {
+          state.winner = score.player >= TARGET_SCORE ? 'You Win!' : 'AI Wins!';
+          state.phase = 'gameOver';
+          return;
+        }
+        resetPaddles();
+        resetPuck(true);
+        setPhase('goalPause', 1);
+      }
+
+      function pointInRect(x, y, rect) {
+        return x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
+      }
+
+      function handleClick(x, y) {
+        if (state.phase === 'menu') {
+          for (const b of ui.buttons) {
+            if (pointInRect(x, y, b)) {
+              startGame(b.key);
+              return;
+            }
+          }
+        }
+
+        if (state.phase === 'gameOver') {
+          const b = ui.buttons.find(btn => btn.key === 'playAgain');
+          if (b && pointInRect(x, y, b)) {
+            state.phase = 'menu';
+          }
+        }
+      }
+
+      function getCanvasPoint(event) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+          x: ((event.clientX - rect.left) / rect.width) * W,
+          y: ((event.clientY - rect.top) / rect.height) * H
+        };
+      }
+
+      function updatePointerFromEvent(event) {
+        const p = getCanvasPoint(event);
+        state.pointerX = clamp(p.x, 0, W);
+        state.pointerY = clamp(p.y, 0, H);
+        return p;
+      }
+
+      canvas.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        canvas.setPointerCapture(e.pointerId);
+        state.pointerActive = true;
+        const p = updatePointerFromEvent(e);
+        handleClick(p.x, p.y);
+      });
+
+      canvas.addEventListener('pointermove', (e) => {
+        if (!state.pointerActive && e.pointerType !== 'mouse') return;
+        updatePointerFromEvent(e);
+      });
+
+      canvas.addEventListener('pointerup', (e) => {
+        if (canvas.hasPointerCapture(e.pointerId)) {
+          canvas.releasePointerCapture(e.pointerId);
+        }
+        state.pointerActive = false;
+      });
+
+      canvas.addEventListener('pointercancel', (e) => {
+        if (canvas.hasPointerCapture(e.pointerId)) {
+          canvas.releasePointerCapture(e.pointerId);
+        }
+        state.pointerActive = false;
+      });
+
+      function drawBoard() {
+        const g = ctx.createLinearGradient(0, 0, 0, H);
+        g.addColorStop(0, '#0a1328');
+        g.addColorStop(0.5, '#040915');
+        g.addColorStop(1, '#0a1328');
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.strokeStyle = 'rgba(118,185,255,0.28)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(1, 1, W - 2, H - 2);
+
+        ctx.beginPath();
+        ctx.moveTo(0, CENTER_Y);
+        ctx.lineTo(W, CENTER_Y);
+        ctx.strokeStyle = 'rgba(154, 201, 255, 0.2)';
+        ctx.setLineDash([10, 10]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.beginPath();
+        ctx.arc(CENTER_X, CENTER_Y, 72, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(154, 201, 255, 0.2)';
+        ctx.stroke();
+
+        // Goal indicators
+        ctx.strokeStyle = 'rgba(228,245,255,0.35)';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.moveTo(CENTER_X - GOAL_HEIGHT / 2, 2);
+        ctx.lineTo(CENTER_X + GOAL_HEIGHT / 2, 2);
+        ctx.moveTo(CENTER_X - GOAL_HEIGHT / 2, H - 2);
+        ctx.lineTo(CENTER_X + GOAL_HEIGHT / 2, H - 2);
+        ctx.stroke();
+      }
+
+      function drawGlowCircle(x, y, r, color, glow = 20) {
+        ctx.save();
+        ctx.shadowColor = color;
+        ctx.shadowBlur = glow;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function drawPaddle(pad) {
+        drawGlowCircle(pad.x, pad.y, pad.r, pad.color, 24);
+        ctx.fillStyle = 'rgba(255,255,255,0.22)';
+        ctx.beginPath();
+        ctx.arc(pad.x - pad.r * 0.2, pad.y - pad.r * 0.25, pad.r * 0.35, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      function drawPuck() {
+        drawGlowCircle(puck.x, puck.y, puck.r, puck.color, 28);
+        ctx.fillStyle = 'rgba(255,255,255,0.75)';
+        ctx.beginPath();
+        ctx.arc(puck.x - 3, puck.y - 4, puck.r * 0.35, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      function drawParticles() {
+        for (const p of particles) {
+          const alpha = 1 - p.age / p.life;
+          ctx.fillStyle = `${p.color}${Math.floor(alpha * 255).toString(16).padStart(2, '0')}`;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.size * alpha, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      function drawScore() {
+        ctx.save();
+        ctx.fillStyle = '#d9ecff';
+        ctx.shadowColor = 'rgba(126, 201, 255, 0.7)';
+        ctx.shadowBlur = 10;
+        ctx.font = '700 44px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${score.ai} : ${score.player}`, CENTER_X, 66);
+        ctx.restore();
+      }
+
+      function drawMenu() {
+        ui.buttons = [];
+        ctx.fillStyle = 'rgba(2, 6, 16, 0.7)';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#e8f5ff';
+        ctx.font = '700 56px Inter, sans-serif';
+        ctx.fillText('Neon Air Hockey', CENTER_X, 170);
+
+        ctx.fillStyle = '#9ec6f1';
+        ctx.font = '500 24px Inter, sans-serif';
+        ctx.fillText('Choose AI Difficulty', CENTER_X, 218);
+
+        const defs = ['easy', 'medium', 'hard'];
+        const hints = { easy: 'Slower + delayed reactions', medium: 'Balanced tracking', hard: 'Predictive + defensive' };
+        defs.forEach((key, i) => {
+          const y = 260 + i * 95;
+          const rect = { x: CENTER_X - 155, y, w: 310, h: 62, key };
+          ui.buttons.push(rect);
+
+          ctx.save();
+          const grad = ctx.createLinearGradient(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
+          grad.addColorStop(0, 'rgba(35,83,149,0.65)');
+          grad.addColorStop(1, 'rgba(69,31,88,0.6)');
+          ctx.fillStyle = grad;
+          ctx.strokeStyle = 'rgba(123,196,255,0.75)';
+          ctx.lineWidth = 2;
+          ctx.shadowColor = 'rgba(80,180,255,0.6)';
+          ctx.shadowBlur = 15;
+
+          const r = 12;
+          ctx.beginPath();
+          ctx.moveTo(rect.x + r, rect.y);
+          ctx.lineTo(rect.x + rect.w - r, rect.y);
+          ctx.quadraticCurveTo(rect.x + rect.w, rect.y, rect.x + rect.w, rect.y + r);
+          ctx.lineTo(rect.x + rect.w, rect.y + rect.h - r);
+          ctx.quadraticCurveTo(rect.x + rect.w, rect.y + rect.h, rect.x + rect.w - r, rect.y + rect.h);
+          ctx.lineTo(rect.x + r, rect.y + rect.h);
+          ctx.quadraticCurveTo(rect.x, rect.y + rect.h, rect.x, rect.y + rect.h - r);
+          ctx.lineTo(rect.x, rect.y + r);
+          ctx.quadraticCurveTo(rect.x, rect.y, rect.x + r, rect.y);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = '#e8f6ff';
+          ctx.font = '700 28px Inter, sans-serif';
+          ctx.fillText(difficultySettings[key].label, CENTER_X, y + 33);
+          ctx.fillStyle = '#b6d4ef';
+          ctx.font = '500 14px Inter, sans-serif';
+          ctx.fillText(hints[key], CENTER_X, y + 52);
+          ctx.restore();
+        });
+      }
+
+      function drawCenterMessage(title, subtitle = '') {
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ecf8ff';
+        ctx.shadowColor = 'rgba(123, 201, 255, 0.8)';
+        ctx.shadowBlur = 14;
+        ctx.font = '700 62px Inter, sans-serif';
+        ctx.fillText(title, CENTER_X, CENTER_Y - 8);
+        if (subtitle) {
+          ctx.shadowBlur = 0;
+          ctx.fillStyle = '#a8c9eb';
+          ctx.font = '500 24px Inter, sans-serif';
+          ctx.fillText(subtitle, CENTER_X, CENTER_Y + 38);
+        }
+      }
+
+      function drawGameOver() {
+        ui.buttons = [];
+        ctx.fillStyle = 'rgba(2, 7, 20, 0.64)';
+        ctx.fillRect(0, 0, W, H);
+        drawCenterMessage(state.winner, `${score.ai} : ${score.player}`);
+
+        const rect = { x: CENTER_X - 140, y: CENTER_Y + 75, w: 280, h: 62, key: 'playAgain' };
+        ui.buttons.push(rect);
+
+        ctx.save();
+        ctx.fillStyle = 'rgba(26, 93, 140, 0.72)';
+        ctx.strokeStyle = 'rgba(133, 215, 255, 0.9)';
+        ctx.lineWidth = 2;
+        ctx.shadowColor = 'rgba(100, 203, 255, 0.7)';
+        ctx.shadowBlur = 16;
+        roundedRect(ctx, rect.x, rect.y, rect.w, rect.h, 12);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = '#ecf8ff';
+        ctx.font = '700 28px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Play Again', CENTER_X, rect.y + 41);
+        ctx.restore();
+      }
+
+      let last = performance.now();
+
+      function roundedRect(targetCtx, x, y, w, h, r) {
+        const rr = Math.min(r, w * 0.5, h * 0.5);
+        targetCtx.beginPath();
+        targetCtx.moveTo(x + rr, y);
+        targetCtx.lineTo(x + w - rr, y);
+        targetCtx.quadraticCurveTo(x + w, y, x + w, y + rr);
+        targetCtx.lineTo(x + w, y + h - rr);
+        targetCtx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+        targetCtx.lineTo(x + rr, y + h);
+        targetCtx.quadraticCurveTo(x, y + h, x, y + h - rr);
+        targetCtx.lineTo(x, y + rr);
+        targetCtx.quadraticCurveTo(x, y, x + rr, y);
+        targetCtx.closePath();
+      }
+
+      function loop(now) {
+        const dt = Math.min(0.033, (now - last) / 1000);
+        last = now;
+
+        drawBoard();
+        updateParticles(dt);
+
+        if (state.phase === 'countdown') {
+          if (now >= state.countdownEnd) {
+            launchPuck();
+            state.phase = 'play';
+          }
+        }
+
+        if (state.phase === 'goalPause') {
+          if (now >= state.pauseEnd) {
+            setPhase('countdown', 1);
+          }
+        }
+
+        if (state.phase === 'play') {
+          updatePlayer(dt);
+          updateAI(dt);
+          updatePuck(dt);
+        } else if (state.phase === 'countdown' || state.phase === 'goalPause') {
+          updatePlayer(dt);
+          updateAI(dt);
+        }
+
+        drawParticles();
+        drawPaddle(ai);
+        drawPaddle(player);
+        drawPuck();
+        drawScore();
+
+        if (state.phase === 'menu') {
+          drawMenu();
+        } else if (state.phase === 'countdown') {
+          const t = Math.ceil((state.countdownEnd - now) / 1000);
+          drawCenterMessage(String(Math.max(1, t)), difficultySettings[state.difficulty].label);
+        } else if (state.phase === 'goalPause') {
+          drawCenterMessage(state.goalText, `Score ${score.ai} : ${score.player}`);
+        } else if (state.phase === 'gameOver') {
+          drawGameOver();
+        }
+
+        requestAnimationFrame(loop);
+      }
+
+      requestAnimationFrame(loop);
+    })();
+  </script>
+</body>
+</html>
